@@ -8,13 +8,15 @@ import io.ktor.server.http.content.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import io.ktor.utils.io.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
-import maestro.ElementFilter
+import maestro.DeviceInfo
 import maestro.Filters
 import maestro.Maestro
 import maestro.TreeNode
 import maestro.orchestra.Orchestra
-import maestro.utils.StringUtils.toRegexSafe
 import java.io.File
 import java.nio.file.Path
 import java.nio.file.Paths
@@ -27,7 +29,6 @@ import maestro.orchestra.MaestroCommand
 import maestro.orchestra.yaml.FlowParseException
 import maestro.orchestra.yaml.MaestroFlowParser
 import maestro.orchestra.yaml.YamlCommandReader
-import maestro.orchestra.yaml.YamlFluentCommand
 
 private data class RunCommandRequest(
     val yaml: String,
@@ -52,6 +53,9 @@ object DeviceService {
     private val savedScreenshots = mutableListOf<File>()
 
     private var lastViewHierarchy: TreeNode? = null
+
+    @Volatile
+    private var cachedDeviceInfo: DeviceInfo? = null
 
     fun routes(routing: Routing, maestro: Maestro) {
         routing.post("/api/run-command") {
@@ -89,8 +93,8 @@ object DeviceService {
                         flush()
                     } catch (_: Exception) {
                         // Ignoring the exception to prevent SSE stream from dying
-                        // Don't log since this floods the terminal after killing studio
                     }
+                    delay(100)
                 }
             }
         }
@@ -139,14 +143,16 @@ object DeviceService {
         val elements = gatherElements(tree, mutableListOf())
             .sortedWith(Filters.INDEX_COMPARATOR)
 
-        fun getIndex(filter: ElementFilter, element: TreeNode): Int? {
-            val identityHashMap = IdentityHashMap<TreeNode, Unit>()
-            val matchingElements = Filters.deepestMatchingElement(filter)(elements).filter {
-                // There are duplicate elements for some reason (likely due to unintended behavior in Filter.deepestMatchingElement) - filter them out
-                identityHashMap.put(it, Unit) == null
+        // Pre-group elements by text and resourceId for O(n) index lookup
+        val textGroups = mutableMapOf<String, MutableList<TreeNode>>()
+        val resourceIdGroups = mutableMapOf<String, MutableList<TreeNode>>()
+        for (element in elements) {
+            element.attribute("text")?.let { text ->
+                textGroups.getOrPut(text) { mutableListOf() }.add(element)
             }
-            if (matchingElements.size < 2) return null
-            return matchingElements.sortedWith(Filters.INDEX_COMPARATOR).indexOf(element)
+            element.attribute("resource-id")?.let { resId ->
+                resourceIdGroups.getOrPut(resId) { mutableListOf() }.add(element)
+            }
         }
 
         val ids = mutableMapOf<String, Int>()
@@ -159,12 +165,14 @@ object DeviceService {
             val textIndex = if (text == null) {
                 null
             } else {
-                getIndex(Filters.textMatches(text.toRegexSafe(Orchestra.REGEX_OPTIONS)), element)
+                val group = textGroups[text]!!
+                if (group.size < 2) null else group.indexOf(element)
             }
             val resourceIdIndex = if (resourceId == null) {
                 null
             } else {
-                getIndex(Filters.idMatches(resourceId.toRegexSafe(Orchestra.REGEX_OPTIONS)), element)
+                val group = resourceIdGroups[resourceId]!!
+                if (group.size < 2) null else group.indexOf(element)
             }
             fun createElementId(): String {
                 val parts = listOfNotNull(resourceId, resourceIdIndex, text, textIndex)
@@ -179,34 +187,35 @@ object DeviceService {
     }
 
     private fun getDeviceScreen(maestro: Maestro): String {
-        val tree: TreeNode
-        val screenshotFile: File
+        val deviceInfo = cachedDeviceInfo ?: maestro.deviceInfo().also { cachedDeviceInfo = it }
+
+        val (tree, screenshotFile) = runBlocking {
+            val hierarchyDeferred = async(Dispatchers.IO) { maestro.viewHierarchy().root }
+            val screenshotDeferred = async(Dispatchers.IO) { takeScreenshot(maestro) }
+            Pair(hierarchyDeferred.await(), screenshotDeferred.await())
+        }
+
+        lastViewHierarchy = tree
         synchronized(DeviceService) {
-            tree = maestro.viewHierarchy().root
-            lastViewHierarchy = tree
-            screenshotFile = takeScreenshot(maestro)
             savedScreenshots.add(screenshotFile)
             while (savedScreenshots.size > MAX_SCREENSHOTS) {
                 savedScreenshots.removeFirst().delete()
             }
         }
 
-        val deviceInfo = maestro.deviceInfo()
-        val deviceWidth = deviceInfo.widthGrid
-        val deviceHeight = deviceInfo.heightGrid
-
         val url = tree.attributes["url"]
         val elements = treeToElements(tree)
-        val deviceScreen = DeviceScreen(deviceInfo.platform, "/screenshot/${screenshotFile.name}", deviceWidth, deviceHeight, elements, url)
+        val deviceScreen = DeviceScreen(deviceInfo.platform, "/screenshot/${screenshotFile.name}", deviceInfo.widthGrid, deviceInfo.heightGrid, elements, url)
         return jacksonObjectMapper()
             .setSerializationInclusion(JsonInclude.Include.NON_NULL)
             .writeValueAsString(deviceScreen)
     }
 
+    private val BOUNDS_PATTERN = Pattern.compile("\\[([0-9-]+),([0-9-]+)]\\[([0-9-]+),([0-9-]+)]")
+
     private fun TreeNode.bounds(): UIElementBounds? {
         val boundsString = attributes["bounds"] ?: return null
-        val pattern = Pattern.compile("\\[([0-9-]+),([0-9-]+)]\\[([0-9-]+),([0-9-]+)]")
-        val m = pattern.matcher(boundsString)
+        val m = BOUNDS_PATTERN.matcher(boundsString)
         if (!m.matches()) {
             System.err.println("Warning: Bounds text does not match expected pattern: $boundsString")
             return null
