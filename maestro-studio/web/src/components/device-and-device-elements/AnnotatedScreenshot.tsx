@@ -28,7 +28,9 @@ const Annotation = ({
   const w = `${(width / deviceWidth) * 100}%`;
   const h = `${(height / deviceHeight) * 100}%`;
 
-  let className = "border border-dashed border-pink-400/60";
+  let className = element.source === "cv"
+    ? "border border-dashed border-green-400/70"
+    : "border border-dashed border-pink-400/60";
   let style: CSSProperties = {};
 
   if (state === "hovered") {
