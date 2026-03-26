@@ -203,12 +203,82 @@ object DeviceService {
             }
         }
 
+        val deviceWidth = deviceInfo.widthGrid
+        val deviceHeight = deviceInfo.heightGrid
+
+        // CV-first: detect elements from screenshot
+        val cvRegions = VisualElementDetector.detect(screenshotFile, deviceWidth, deviceHeight)
+
+        // Tree elements as metadata source
+        val treeElements = treeToElements(tree)
+
+        // Merge: CV elements enriched with tree metadata
+        val elements = mergeElements(cvRegions, treeElements, deviceWidth, deviceHeight)
+
         val url = tree.attributes["url"]
-        val elements = treeToElements(tree)
-        val deviceScreen = DeviceScreen(deviceInfo.platform, "/screenshot/${screenshotFile.name}", deviceInfo.widthGrid, deviceInfo.heightGrid, elements, url)
+        val deviceScreen = DeviceScreen(deviceInfo.platform, "/screenshot/${screenshotFile.name}", deviceWidth, deviceHeight, elements, url)
         return jacksonObjectMapper()
             .setSerializationInclusion(JsonInclude.Include.NON_NULL)
             .writeValueAsString(deviceScreen)
+    }
+
+    private fun mergeElements(
+        cvRegions: List<VisualElementDetector.DetectedRegion>,
+        treeElements: List<UIElement>,
+        deviceWidth: Int,
+        deviceHeight: Int
+    ): List<UIElement> {
+        val usedTreeElements = mutableSetOf<String>()
+        val result = mutableListOf<UIElement>()
+
+        // CV elements are primary
+        for ((index, region) in cvRegions.withIndex()) {
+            val matchingTree = treeElements
+                .filter { it.bounds != null && it.id !in usedTreeElements }
+                .maxByOrNull { overlapRatio(region.bounds, it.bounds!!) }
+                ?.takeIf { it.bounds != null && overlapRatio(region.bounds, it.bounds!!) > 0.3 }
+
+            if (matchingTree != null) {
+                usedTreeElements.add(matchingTree.id)
+            }
+
+            result.add(UIElement(
+                id = matchingTree?.id ?: "cv-$index",
+                bounds = region.bounds,
+                resourceId = matchingTree?.resourceId,
+                resourceIdIndex = matchingTree?.resourceIdIndex,
+                text = matchingTree?.text,
+                hintText = matchingTree?.hintText,
+                accessibilityText = matchingTree?.accessibilityText,
+                textIndex = matchingTree?.textIndex,
+                source = "cv"
+            ))
+        }
+
+        // Append tree-only elements not matched by CV (fallback)
+        for (treeElement in treeElements) {
+            if (treeElement.id !in usedTreeElements && treeElement.bounds != null) {
+                val b = treeElement.bounds
+                val isFullScreen = b.width >= deviceWidth * 0.95 && b.height >= deviceHeight * 0.95
+                if (!isFullScreen) {
+                    result.add(treeElement.copy(source = "tree"))
+                    usedTreeElements.add(treeElement.id)
+                }
+            }
+        }
+
+        return result
+    }
+
+    private fun overlapRatio(a: UIElementBounds, b: UIElementBounds): Double {
+        val x1 = maxOf(a.x, b.x)
+        val y1 = maxOf(a.y, b.y)
+        val x2 = minOf(a.x + a.width, b.x + b.width)
+        val y2 = minOf(a.y + a.height, b.y + b.height)
+        if (x2 <= x1 || y2 <= y1) return 0.0
+        val intersection = (x2 - x1).toLong() * (y2 - y1)
+        val smallerArea = minOf(a.width.toLong() * a.height, b.width.toLong() * b.height)
+        return if (smallerArea == 0L) 0.0 else intersection.toDouble() / smallerArea
     }
 
     private val BOUNDS_PATTERN = Pattern.compile("\\[([0-9-]+),([0-9-]+)]\\[([0-9-]+),([0-9-]+)]")
