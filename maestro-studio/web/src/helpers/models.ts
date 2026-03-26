@@ -23,6 +23,7 @@ export type UIElement = {
   hintText?: string;
   textIndex?: number;
   accessibilityText?: string;
+  source?: string;
 };
 
 export type DeviceScreen = {

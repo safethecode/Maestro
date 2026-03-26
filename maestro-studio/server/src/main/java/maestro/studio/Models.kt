@@ -28,7 +28,8 @@ data class UIElement(
     val text: String?,
     val hintText: String?,
     val accessibilityText: String?,
-    val textIndex: Int?
+    val textIndex: Int?,
+    val source: String = "tree"
 )
 
 enum class ReplCommandStatus {
